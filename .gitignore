@@ -1,0 +1,23 @@
+# ROS2 / colcon build artifacts
+build/
+install/
+log/
+
+# ROS runtime
+*.roslog
+__pycache__/
+*.pyc
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Perf output (tros_perf warn2file)
+perf/
