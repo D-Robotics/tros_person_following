@@ -34,6 +34,7 @@
 #include <ai_msgs/msg/perception_targets.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/u_int8.hpp>
 #include <std_srvs/srv/set_bool.hpp>
 
 namespace tros_person_following
@@ -239,6 +240,7 @@ private:
   std::string followed_target_pose_topic_ = "tros_followed_target_pose";  // 跟踪目标 map 系位姿话题
   std::string followed_target_topic_ = "tros_person_followed";  // 跟踪目标信息话题（ai_msgs）
   std::string status_topic_ = "tros_tracking_status";  // 跟随状态话题（std_msgs/String，latched）
+  std::string buzzer_pattern_topic_ = "/buzzer_pattern";  // 蜂鸣器 pattern 话题（std_msgs/UInt8，originbot_base 解码发声）
   std::string predict_traj_topic_ = "predict_trajectory";  // 预测轨迹可视化话题（nav_msgs/Path）
   std::string cmd_vel_topic_ = "/cmd_vel";  // 原地旋转发 cmd_vel 的话题
   std::string costmap_topic_ = "/global_costmap/costmap";  // 全局 costmap 订阅话题
@@ -364,6 +366,13 @@ private:
   // ======================================================================
   enum class TrackState { IDLE, TRACKING, LOST };
   TrackState track_state_{TrackState::IDLE};
+  // 粗状态转换入口（去重）：所有 track_state_ 赋值都走它。只在 TRACKING→LOST
+  // 转换时发蜂鸣器 pattern 1（1 短声）提醒被跟踪人"目标丢失"；进入 TRACKING
+  // （锁定/重锁）不响。buzzer_min_interval_sec_ 在 publishBuzzerPattern 内节流。
+  void setTrackState(TrackState s);
+  // 发一个蜂鸣器 pattern 到 /buzzer_pattern（originbot_base 解码发声）。
+  // buzzer_min_interval_sec_: <0 不发任何蜂鸣器消息（禁用）；==0 不限制；>0 节流。
+  void publishBuzzerPattern(uint8_t pattern);
   uint64_t tracking_track_id_{0};     // 当前跟随目标 track_id（IDLE 时为 0）
   bool target_lost_{false};           // TRACKING 期本帧未检测到目标（pending-lost 宽限期内）
   rclcpp::Time tp_target_lost_;       // 首次丢失时刻（进 pending-lost 宽限期）
@@ -388,6 +397,16 @@ private:
   // Status & diagnostics — 状态发布 + 距离缓存（追加到状态串 :dist=）
   // ======================================================================
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_ = nullptr;
+  // 蜂鸣器状态提示 publisher（非 latched：buzzer 是一次性事件，latching 会让
+  // originbot_base 重启时重放上一条 pattern 误响一声）。
+  rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr buzzer_pattern_pub_ = nullptr;
+  // 蜂鸣器节流参数 buzzer_min_interval_sec（秒）：
+  //   >0 = 距上次发声不足该值则跳过（压 TRACKING↔LOST 闪烁震荡，避免持续嗡鸣）；
+  //   ==0 = 不限制（每次 TRACKING→LOST 都发声）；
+  //   <0 = 完全禁用（不发任何蜂鸣器控制消息）。
+  double buzzer_min_interval_sec_ = 3.0;
+  rclcpp::Time last_buzzer_time_;      // 上次发声时刻
+  bool buzzer_ever_fired_ = false;      // 是否已发过至少一次（首次不节流）
   // 上一帧相机系前向深度（m）：setFollowStatus 去重，状态切换帧需带 :dist=。
   double last_target_dist_ = -1.0;
   // 上一帧 map 系欧氏距离（m）：跟随距离带判断用的同一值，发布到 :dist=。

@@ -275,6 +275,10 @@ def generate_launch_description():
         'enable_websocket',
         default_value='True',
         description='Whether to launch websocket node')
+    declare_buzzer_min_interval_sec_cmd = DeclareLaunchArgument(
+        'buzzer_min_interval_sec',
+        default_value='3.0',
+        description='Buzzer throttle (s): >0 min interval between beeps; ==0 no limit; <0 disable buzzer entirely. Only TRACKING->LOST beeps (1 short).')
 
     load_nodes = GroupAction(
         actions=
@@ -390,6 +394,8 @@ def generate_launch_description():
                     # ROI edge check; edge_margin_ratio is the edge band fraction.
                     'image_width': LaunchConfiguration('image_width'),
                     'edge_margin_ratio': LaunchConfiguration('edge_margin_ratio'),
+                    # 蜂鸣器节流(秒)：>0 最小间隔；==0 不限制；<0 禁用蜂鸣器。
+                    'buzzer_min_interval_sec': LaunchConfiguration('buzzer_min_interval_sec'),
                 }],
                 arguments=['--ros-args', '--log-level', log_level],
                 output='screen'
@@ -499,5 +505,6 @@ def generate_launch_description():
         declare_mot_config_cmd,
         declare_enable_perc_render_cmd,
         declare_enable_websocket_cmd,
+        declare_buzzer_min_interval_sec_cmd,
         load_nodes,
     ])

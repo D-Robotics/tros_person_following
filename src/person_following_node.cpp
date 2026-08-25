@@ -110,6 +110,8 @@ PersonFollowingNode::PersonFollowingNode(const rclcpp::NodeOptions & options)
   // --- LOST recovery / belief search / relock ---
   this->declare_parameter<float>("tracking_to_lost_timeout_sec", 1.0);
   this->declare_parameter<float>("lost_to_idle_timeout_sec", 5.0);
+  // --- 蜂鸣器节流：最小发声间隔（秒），压制 TRACKING↔LOST 闪烁 chatter ---
+  this->declare_parameter<double>("buzzer_min_interval_sec", 3.0);
   this->declare_parameter<double>("belief_search_timeout_sec", 8.0);
   this->declare_parameter<int>("belief_search_max_rounds", 2);
   // LOST 持续时间分段的 relock 距离阈值（早期严格、晚期宽松）。
@@ -178,6 +180,7 @@ PersonFollowingNode::PersonFollowingNode(const rclcpp::NodeOptions & options)
   // --- LOST recovery / belief search / relock ---
   tracking_to_lost_timeout_sec_ = this->get_parameter("tracking_to_lost_timeout_sec").as_double();
   lost_to_idle_timeout_sec_ = this->get_parameter("lost_to_idle_timeout_sec").as_double();
+  buzzer_min_interval_sec_ = this->get_parameter("buzzer_min_interval_sec").as_double();
   belief_search_timeout_sec_ = this->get_parameter("belief_search_timeout_sec").as_double();
   belief_search_max_rounds_ = this->get_parameter("belief_search_max_rounds").as_int();
   relock_dist_phase1_ = this->get_parameter("relock_dist_phase1").as_double();
@@ -294,6 +297,11 @@ PersonFollowingNode::PersonFollowingNode(const rclcpp::NodeOptions & options)
   // Mirrors frontier_exploration's tros_tracking_status pattern.
   status_pub_ = this->create_publisher<std_msgs::msg::String>(
     status_topic_, rclcpp::QoS(10).transient_local());
+
+  // 蜂鸣器状态提示 publisher：仅 TRACKING->LOST 转换时发 pattern 1（1 短声），
+  // 由 originbot_base 订阅 /buzzer_pattern 解码发声；进入 TRACKING 不响。
+  buzzer_pattern_pub_ = this->create_publisher<std_msgs::msg::UInt8>(
+    buzzer_pattern_topic_, 10);
 
   // Followed-target info publisher (ai_msgs/PerceptionTargets, latched).
   followed_target_pub_ = this->create_publisher<ai_msgs::msg::PerceptionTargets>(
@@ -482,7 +490,7 @@ void PersonFollowingNode::detectResultCallback(
       belief_search_.active = false;  // end belief-guided search
       publishBeliefSearchPath();  // clear the search path display
       spin_stop_requested_ = true;   // stop any in-flight scan
-      track_state_ = TrackState::IDLE;
+      setTrackState(TrackState::IDLE);
       tracking_track_id_ = 0;
       // Restart the search-timeout window now that we're (re)entering IDLE,
       // so continue_search's `elapsed < idle_search_total_timeout_sec_` gate allows
@@ -520,7 +528,7 @@ void PersonFollowingNode::detectResultCallback(
         RCLCPP_INFO(this->get_logger(),
           "[LOST-FLOW 2] target id=%lu lost, transitioning TRACKING -> LOST",
           tracking_track_id_);
-        track_state_ = TrackState::LOST;
+        setTrackState(TrackState::LOST);
         following_active_ = false;  // reset hysteresis state: next TRACKING re-enters via enter threshold
         tp_lost_ = this->now();
         target_lost_ = false;
@@ -652,7 +660,7 @@ void PersonFollowingNode::detectResultCallback(
           tracking_track_id_);
         belief_search_.active = false;  // interrupt belief-guided search
         spin_stop_requested_ = true;   // stop any in-flight scan
-        track_state_ = TrackState::TRACKING;
+        setTrackState(TrackState::TRACKING);
         following_active_ = false;  // reset hysteresis: re-acquired target enters via threshold
         target_lost_ = false;
         tp_target_find_start_ = this->now();
@@ -742,7 +750,7 @@ void PersonFollowingNode::detectResultCallback(
         }
         last_nav_goal_pose_ = nullptr;
         tracking_track_id_ = new_target->target->track_id;
-        track_state_ = TrackState::TRACKING;
+        setTrackState(TrackState::TRACKING);
         following_active_ = false;  // reset hysteresis: new target enters via threshold
         target_lost_ = false;
         tp_target_find_start_ = this->now();
@@ -990,7 +998,7 @@ void PersonFollowingNode::detectResultCallback(
   // Transition IDLE -> TRACKING: acquire new target and disable blind zone observing
   spin_stop_requested_ = true;  // stop async spin before issuing nav goals
   tracking_track_id_ = best.target->track_id;
-  track_state_ = TrackState::TRACKING;
+  setTrackState(TrackState::TRACKING);
   following_active_ = false;  // reset hysteresis: new target enters via threshold
   tp_target_find_start_ = this->now();
   publishBlindZoneObserving(false);
@@ -1037,7 +1045,7 @@ void PersonFollowingNode::startFollowing()
   last_nav_goal_pose_ = nullptr;
 
   follow_enabled_ = true;
-  track_state_ = TrackState::IDLE;
+  setTrackState(TrackState::IDLE);
   tracking_track_id_ = 0;
   following_active_ = false;  // start clean: first target enters via threshold
   target_lost_ = false;
@@ -1077,7 +1085,7 @@ void PersonFollowingNode::stopFollowing()
   publishBlindZoneObserving(true);
 
   follow_enabled_ = false;
-  track_state_ = TrackState::IDLE;
+  setTrackState(TrackState::IDLE);
   tracking_track_id_ = 0;
   following_active_ = false;  // defensive: reset hysteresis state on disable
   target_lost_ = false;
@@ -2711,6 +2719,56 @@ void PersonFollowingNode::setFollowStatus(FollowStatus s)
   msg.data = str;
   status_pub_->publish(msg);
   RCLCPP_INFO(this->get_logger(), "follow status: %s", msg.data.c_str());
+}
+
+// 粗状态转换入口（去重）：在 IDLE→TRACKING（锁定/重锁）发 pattern 1（1 声），
+// TRACKING→LOST（丢失）发 pattern 2（2 声）；→IDLE 静默。复用 originbot_base
+// 的 /buzzer_pattern 声音库，本节点只决定"何时响、响几声"。
+// 不 hook 在细粒度 follow_status_ 上——跟踪中子状态(TRACKING_TOO_CLOSE / 各种
+// LOST_* 恢复策略)来回切会反复响；hook 在 3 态粗状态转换上才干净。
+void PersonFollowingNode::setTrackState(TrackState s)
+{
+  if (track_state_ == s) {
+    return;  // 去重：同态切换（如换目标 id 仍 TRACKING）不响
+  }
+  TrackState prev = track_state_;
+  track_state_ = s;
+  if (!buzzer_pattern_pub_) {
+    return;
+  }
+  // 只在 TRACKING -> LOST 时响一声（pattern 1 = 1 短声）；进入 TRACKING（锁定/重锁）不响，
+  // 避免锁定/重锁频繁发声。buzzer_min_interval_sec_ 在 publishBuzzerPattern 内进一步节流。
+  if (s == TrackState::LOST && prev == TrackState::TRACKING) {
+    publishBuzzerPattern(1);
+  }
+  // * -> TRACKING / -> IDLE：静默
+}
+
+void PersonFollowingNode::publishBuzzerPattern(uint8_t pattern)
+{
+  if (!buzzer_pattern_pub_) {
+    return;
+  }
+  // buzzer_min_interval_sec_: <0 完全禁用（不发任何蜂鸣器消息）；==0 不限制；
+  // >0 距上次发声不足该值则跳过（压 TRACKING↔LOST 闪烁震荡，避免持续嗡鸣）。
+  if (buzzer_min_interval_sec_ < 0.0) {
+    return;  // 禁用蜂鸣器
+  }
+  if (buzzer_min_interval_sec_ > 0.0 && buzzer_ever_fired_) {
+    const double elapsed = (this->now() - last_buzzer_time_).seconds();
+    if (elapsed < buzzer_min_interval_sec_) {
+      RCLCPP_DEBUG(this->get_logger(),
+        "buzzer pattern %d throttled (%.2fs < %.2fs min interval)",
+        pattern, elapsed, buzzer_min_interval_sec_);
+      return;
+    }
+  }
+  last_buzzer_time_ = this->now();
+  buzzer_ever_fired_ = true;
+  std_msgs::msg::UInt8 msg;
+  msg.data = pattern;
+  buzzer_pattern_pub_->publish(msg);
+  RCLCPP_INFO(this->get_logger(), "buzzer pattern %d on TRACKING->LOST", pattern);
 }
 
 void PersonFollowingNode::asyncNavToGoal(const NavigateToPose::Goal & goal)

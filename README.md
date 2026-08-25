@@ -1,6 +1,10 @@
 # tros_person_following
 
-ROS2 人员跟随控制节点。订阅 AI 感知结果（`ai_msgs::msg::PerceptionTargets`），从中选取目标人员，通过 Nav2 `NavigateToPose` action 自主导航跟随，实现机器人对人体目标的自动跟踪。含目标丢失恢复（belief search）、边缘转向（edge-turn）、静止目标切换、轨迹预测等能力。
+![vims_person_tracking](images/vims_person_tracking.gif)
+
+> 完整的人体跟随效果： [vims_person_tracking.mp4](https://archive.d-robotics.cc/TogetheROS/files/vision_mobile_solution/images/vims_person_tracking.mp4)
+
+ROS2 人体跟随控制节点。订阅 AI 感知结果（`ai_msgs::msg::PerceptionTargets`），从中选取目标人体，通过 Nav2 `NavigateToPose` action 自主导航跟随，实现机器人对人体目标的自动跟踪。含目标丢失恢复（belief search）、边缘转向（edge-turn）、静止目标切换、轨迹预测等能力。
 
 > 目标丢失后的恢复流程（LOST 状态机、belief search、relock 距离门控、edge-turn 等）详见 [docs/LOST_REACQUIRE_FLOW.md](docs/LOST_REACQUIRE_FLOW.md)。
 
@@ -54,6 +58,16 @@ IDLE ──(检测到有效 moving 目标)──> TRACKING ──(连续丢失�
 
 - 进入 TRACKING 状态时发布 `enable_blind_zone_observing: false`，暂停盲区观测
 - 进入 LOST 或 IDLE 状态时发布 `enable_blind_zone_observing: true`，恢复盲区观测
+
+### 蜂鸣器状态提示
+
+通过蜂鸣器提醒**被跟踪人**当前跟踪状态（依赖 `originbot_base` 提供的 `/buzzer_pattern` 声音库，本节点只决定"何时响"）：
+
+- **仅 `TRACKING → LOST` 转换响一声**（pattern 1 = 1 短声）：目标丢失时提醒被跟踪人"机器人丢你了"。
+- **进入 TRACKING（锁定 / 重锁 / 切目标）不响**：避免锁定/重锁频繁发声吵人。
+- **`→ IDLE`（放弃 / 停止）静默**。
+- 节流：`buzzer_min_interval_sec` 秒内不重复发声，压制检测闪烁导致的 `TRACKING ↔ LOST` 快速震荡 chatter（详见参数说明）。
+- 注意：依赖 `originbot_base` 新二进制（含 `/buzzer_pattern` 订阅解码发声）同板在线，否则本节点发的 pattern 无人解码、不响。
 
 ## 编译与运行
 
@@ -142,6 +156,7 @@ ros2 service call /enable_follow std_srvs/srv/SetBool "{data: false}"
 | 发布 | `tros_person_followed` | `ai_msgs/msg/PerceptionTargets` | 跟踪目标信息（track_id+rois+状态） |
 | 发布 | `predict_trajectory` | `nav_msgs/msg/Path` | 预测轨迹 / belief 搜索路径（RViz） |
 | 发布 | `enable_blind_zone_observing` | `std_msgs/msg/Bool` | 盲区观测使能 |
+| 发布 | `/buzzer_pattern` | `std_msgs/msg/UInt8` | 蜂鸣器状态提示（pattern id，`originbot_base` 解码发声；仅 TRACKING→LOST 发 1） |
 | 发布 | `/cmd_vel` | `geometry_msgs/msg/Twist` | 原地旋转 / 停车（绕过 Nav2） |
 | 客户端 | `navigate_to_pose` | `nav2_msgs/action/NavigateToPose` | Nav2 导航 Action |
 | 服务 | `enable_follow` | `std_srvs/srv/SetBool` | 启停跟随 |
@@ -257,6 +272,12 @@ ros2 service call /enable_follow std_srvs/srv/SetBool "{data: false}"
 | `costmap_free_cost_thr` | double | 50.0 | cell cost 低于此值视为 free |
 | `costmap_free_search_radius_m` | double | 2.0 | 人附近 BFS 最近 free cell 的半径（m） |
 
+### 蜂鸣器 — 跟踪状态提示
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `buzzer_min_interval_sec` | double | 3.0 | 蜂鸣器最小发声间隔（秒）。`>0` 距上次发声不足该值则跳过（压 `TRACKING↔LOST` 闪烁 chatter）；`==0` 不限制（每次 `TRACKING→LOST` 都响）；`<0` 完全禁用（不发任何蜂鸣器控制消息）。仅 `TRACKING→LOST` 响 1 声（pattern 1），进入 TRACKING 不响。 |
+
 ### Launch 文件额外参数（控制链路中其他节点）
 
 | 参数 | 类型 | 默认值 | 说明 |
@@ -291,6 +312,14 @@ ros2 service call /enable_follow std_srvs/srv/SetBool "{data: false}"
 - **机器人不停调整位置（抖动）**：增大 `follow_goal_dist_deadzone` 和 `follow_goal_yaw_deadzone`，减少小幅 goal 变化触发重发
 - **目标快走、机器人跟不上**：增大 `follow_goal_pub_rate`（如 3.0~4.0 Hz），更频繁更新 nav goal
 - **Nav2 报 tick-rate exceeded / ComputePathToPose 超时**：减小 `follow_goal_pub_rate`（如 1.5 Hz），减轻 Nav2 planner 压力
+
+### 蜂鸣器
+
+- **响太频繁 / 嗡鸣**：增大 `buzzer_min_interval_sec`（如 4.0~5.0），拉长两次发声最小间隔
+- **丢失了没及时响**：减小 `buzzer_min_interval_sec`（如 1.5~2.0），但别低于 chatter 周期否则回嗡鸣
+- **完全不要响**：设 `buzzer_min_interval_sec:=-1.0`（禁用，不发蜂鸣器消息）
+- **每次丢失都响（不限频）**：设 `buzzer_min_interval_sec:=0.0`（chatter 时会嗡鸣，仅调试用）
+- 注意：只在 `TRACKING → LOST` 响 1 声；进入 TRACKING 不响是设计如此，不是 bug
 
 ### 搜索行为
 
