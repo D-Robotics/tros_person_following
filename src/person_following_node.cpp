@@ -2213,33 +2213,6 @@ void PersonFollowingNode::startBeliefSearch()
     return;
   }
 
-  // Near-distance shortcut: if the robot is already within follow_distance_min_
-  // of the LKP, skip the NavigateToPose to the observation point — the robot is
-  // essentially on top of the LKP, a nav goal would be ≈0m (deadzone/abort
-  // churn). Force at_lkp=true and jump straight into continueBeliefSearch's
-  // scan/iterate framework, which starts the in-place scan this frame (active
-  // is already true, and dist<follow_distance_min_<1.5 so the too-far-scan gate
-  // in continueBeliefSearch does not fire).
-  {
-    auto robot_pose = getCurrentPose();
-    double dist_to_lkp = std::hypot(
-      belief_search_.lkp.x - robot_pose.pose.position.x,
-      belief_search_.lkp.y - robot_pose.pose.position.y);
-    if (dist_to_lkp < follow_distance_min_) {
-      RCLCPP_INFO(this->get_logger(),
-        "[LOST-FLOW 6] robot %.2f m from LKP (<follow_distance_min %.2f), skip nav, scan in place",
-        dist_to_lkp, follow_distance_min_);
-      belief_search_.at_lkp = true;  // force: continueBeliefSearch scans only at_lkp==true
-      if (nav_goal_handle_) {  // defensive: LOST entry FLOW 3 already canceled
-        nav_client_->async_cancel_goal(nav_goal_handle_);
-        nav_goal_handle_ = nullptr;
-      }
-      setFollowStatus(FollowStatus::LOST_BELIEF_SCAN);  // mirrors continueBeliefSearch's scan-start
-      continueBeliefSearch();  // starts the in-place scan this frame (active already true)
-      return;
-    }
-  }
-
   // Cancel any in-flight nav goal, navigate to observation point.
   if (nav_goal_handle_) {
     nav_client_->async_cancel_goal(nav_goal_handle_);
@@ -2395,35 +2368,6 @@ void PersonFollowingNode::continueBeliefSearch()
     // Search ended → revert to plain LOST (waiting for LOST timeout → IDLE).
     setFollowStatus(FollowStatus::LOST);
     return;
-  }
-
-  // Near-distance shortcut (mirrors startBeliefSearch's): if the robot is
-  // already within follow_distance_min_ of the LKP, skip the NavigateToPose to
-  // the next observation point — a nav goal would be ≈0m (deadzone/abort churn).
-  // Roll back the round++ above and re-enter the scan-start path: force
-  // at_lkp=true so continueBeliefSearch's scan gate fires this frame. The
-  // search still ends via belief_search_timeout_sec_ if the target is never
-  // re-found (round stays put while near, but the timeout is the real bound).
-  {
-    auto robot_pose = getCurrentPose();
-    double dist_to_lkp = std::hypot(
-      belief_search_.lkp.x - robot_pose.pose.position.x,
-      belief_search_.lkp.y - robot_pose.pose.position.y);
-    if (dist_to_lkp < follow_distance_min_) {
-      RCLCPP_INFO(this->get_logger(),
-        "[LOST-FLOW] belief search round %d: robot %.2f m from LKP (<follow_distance_min %.2f), skip nav, scan in place",
-        belief_search_.round, dist_to_lkp, follow_distance_min_);
-      belief_search_.round--;  // undo round++ so we retry this round after the scan
-      belief_search_.at_lkp = true;  // force: continueBeliefSearch scans only at_lkp==true
-      // Record this obs point so is_searched excludes it after the scan (avoid
-      // re-picking the same point once we do advance).
-      belief_search_.searched_points.push_back(obs.pose.position);
-      // Re-enter scan-start: scanning=false & scan_completed=false (reset above)
-      // → continueBeliefSearch starts the in-place scan this frame and sets
-      // LOST_BELIEF_SCAN status itself.
-      continueBeliefSearch();
-      return;
-    }
   }
 
   if (nav_goal_handle_) {
